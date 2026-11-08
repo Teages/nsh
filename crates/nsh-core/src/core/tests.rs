@@ -332,17 +332,17 @@ fn pan_permission_filters_native_values_and_events_without_losing_them() {
 /// The tokens of a theme file of the tests' own format, `{ "key":
 /// "#rrggbb", … }` over the sample's (`None`: the sample's): the core reads
 /// `uiTheme` with what a UI set brings.
-fn test_tokens(json: Option<&str>) -> Result<crate::element::Tokens, String> {
+fn test_tokens(json: Option<&str>) -> Result<(crate::element::Tokens, Vec<String>), String> {
     let mut tokens = crate::element::tokens::sample();
     let Some(json) = json else {
-        return Ok(tokens);
+        return Ok((tokens, Vec::new()));
     };
     let value: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
     for (key, value) in value.as_object().ok_or("not an object")? {
         let color = value.as_str().and_then(Color::parse).ok_or("not a color")?;
         tokens.set_color(key, color.into());
     }
-    Ok(tokens)
+    Ok((tokens, Vec::new()))
 }
 
 /// Tokens with just `colors`.
@@ -2439,6 +2439,37 @@ fn scrolled(batch: &MountBatch, start: f32) -> f32 {
         MountItem::ScrollBy { id: 2, dy, .. } => at + dy.0,
         _ => at,
     })
+}
+
+#[test]
+fn bottom_aligned_list_does_not_mount_scrolls_during_native_bounce() {
+    let mut c = core();
+    estimated_list(&mut c);
+    apply(
+        &mut c,
+        vec![
+            Op::SetProp {
+                id: 2,
+                prop: Prop::ListAlignment(crate::ListAlignment::Bottom),
+            },
+            Op::SetProp {
+                id: 2,
+                prop: Prop::FollowEnd(Some(px(80.0))),
+            },
+        ],
+    );
+    c.commit();
+    let (mut next_id, mut cells) = (100, Vec::new());
+    for _ in 0..3 {
+        render_binds(&mut c, &mut next_id, &mut cells, 50.0);
+        c.commit();
+    }
+    for offset in [4610.0, 4630.0, 4660.0, 4630.0, 4610.0, 4600.0] {
+        c.set_scroll_offset(2, point(px(0.0), px(offset)), u32::MAX);
+        if let Some(batch) = c.commit() {
+            assert_eq!(scrolled(&batch, offset), offset, "native offset {offset}");
+        }
+    }
 }
 
 #[test]
@@ -4746,6 +4777,112 @@ fn view_with_classes(c: &mut Core<FakeEngine>, id: NodeId, classes: &str) {
     );
 }
 
+/// A JS value for the host decoders in these tests, with the shapes they
+/// read: objects of fields, arrays, strings, numbers, booleans and null.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "a test input implements the whole HostInput trait"
+)]
+enum HostTestValue<'a> {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(&'a str),
+    Object(Vec<(&'a str, HostTestValue<'a>)>),
+    Array(Vec<HostTestValue<'a>>),
+}
+
+impl<'a> HostTestValue<'a> {
+    fn object(fields: impl IntoIterator<Item = (&'a str, HostTestValue<'a>)>) -> Self {
+        Self::Object(fields.into_iter().collect())
+    }
+}
+
+struct HostTestList<'a>(Vec<HostTestValue<'a>>);
+
+impl<'a> crate::js::host::HostList for HostTestList<'a> {
+    type Item = HostTestValue<'a>;
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn item(&self, index: usize) -> Option<Self::Item> {
+        self.0.get(index).cloned()
+    }
+}
+
+impl<'a> crate::js::host::HostInput for HostTestValue<'a> {
+    type List = HostTestList<'a>;
+
+    fn is_nullish(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+
+    fn is_object(&self) -> bool {
+        matches!(self, Self::Object(_) | Self::Array(_))
+    }
+
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    fn as_number(&self) -> Option<f64> {
+        match self {
+            Self::Number(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    fn as_string(&self) -> Option<String> {
+        match self {
+            Self::String(v) => Some((*v).to_owned()),
+            _ => None,
+        }
+    }
+
+    fn field(&self, key: &str) -> Option<Self> {
+        match self {
+            Self::Object(fields) => fields
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.clone()),
+            _ => None,
+        }
+    }
+
+    fn as_list(&self) -> Option<Self::List> {
+        match self {
+            Self::Array(items) => Some(HostTestList(items.clone())),
+            _ => None,
+        }
+    }
+
+    fn entries(&self) -> Vec<(String, Self)> {
+        match self {
+            Self::Object(fields) => fields
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), value.clone()))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn truthy(&self) -> bool {
+        match self {
+            Self::Null => false,
+            Self::Bool(v) => *v,
+            Self::Number(v) => *v != 0.0 && !v.is_nan(),
+            Self::String(v) => !v.is_empty(),
+            Self::Object(_) | Self::Array(_) => true,
+        }
+    }
+}
+
 #[test]
 fn backdrop_material_survives_restyling_and_resets() {
     use crate::{BackdropMaterial, js::host::HostProps};
@@ -4821,6 +4958,244 @@ fn backdrop_material_survives_restyling_and_resets() {
     .unwrap();
     let mounted = view_style_of(&c.commit().unwrap(), 2).unwrap();
     assert_eq!(mounted.backdrop_material, BackdropMaterial::UltraThin);
+    assert!(!mounted.effects.unwrap().backdrop_filters.is_empty());
+}
+
+#[test]
+fn macos_backdrop_decodes_and_survives_restyling() {
+    use crate::{
+        MacOsBackdrop, MacOsBackdropBlending, MacOsBackdropMaterial, MacOsBackdropState,
+        js::host::{HostCx, HostProps},
+    };
+    let decode = |value: HostTestValue<'_>| {
+        let mut cx = HostCx::for_element(Tag::View);
+        <Prop as HostProps>::decode("backdrop", &value, &mut cx)
+            .expect("a macOS backdrop prop")
+            .expect("a value")
+    };
+    // Its fields default to AppKit's popover material, within the window,
+    // active.
+    assert_eq!(
+        MacOsBackdrop::default(),
+        MacOsBackdrop {
+            material: MacOsBackdropMaterial::Popover,
+            blending: MacOsBackdropBlending::WithinWindow,
+            state: MacOsBackdropState::Active,
+        }
+    );
+    // Every material AppKit's roles name decodes from the API's camel case.
+    for (name, material) in [
+        ("titlebar", MacOsBackdropMaterial::Titlebar),
+        ("selection", MacOsBackdropMaterial::Selection),
+        ("menu", MacOsBackdropMaterial::Menu),
+        ("popover", MacOsBackdropMaterial::Popover),
+        ("sidebar", MacOsBackdropMaterial::Sidebar),
+        ("headerView", MacOsBackdropMaterial::HeaderView),
+        ("sheet", MacOsBackdropMaterial::Sheet),
+        ("windowBackground", MacOsBackdropMaterial::WindowBackground),
+        ("hudWindow", MacOsBackdropMaterial::HudWindow),
+        ("fullScreenUI", MacOsBackdropMaterial::FullScreenUI),
+        ("toolTip", MacOsBackdropMaterial::ToolTip),
+        (
+            "contentBackground",
+            MacOsBackdropMaterial::ContentBackground,
+        ),
+        (
+            "underWindowBackground",
+            MacOsBackdropMaterial::UnderWindowBackground,
+        ),
+        (
+            "underPageBackground",
+            MacOsBackdropMaterial::UnderPageBackground,
+        ),
+    ] {
+        let prop = decode(HostTestValue::object([(
+            "material",
+            HostTestValue::String(name),
+        )]));
+        assert_eq!(
+            prop,
+            Prop::MacOsBackdrop(Some(MacOsBackdrop {
+                material,
+                ..MacOsBackdrop::default()
+            })),
+            "{name}"
+        );
+    }
+    for (name, blending) in [
+        ("withinWindow", MacOsBackdropBlending::WithinWindow),
+        ("behindWindow", MacOsBackdropBlending::BehindWindow),
+    ] {
+        let prop = decode(HostTestValue::object([(
+            "blending",
+            HostTestValue::String(name),
+        )]));
+        assert_eq!(
+            prop,
+            Prop::MacOsBackdrop(Some(MacOsBackdrop {
+                material: MacOsBackdropMaterial::default(),
+                blending,
+                state: MacOsBackdropState::default(),
+            })),
+            "{name}"
+        );
+    }
+    for (name, state) in [
+        (
+            "followsWindowActiveState",
+            MacOsBackdropState::FollowsWindowActiveState,
+        ),
+        ("active", MacOsBackdropState::Active),
+        ("inactive", MacOsBackdropState::Inactive),
+    ] {
+        let prop = decode(HostTestValue::object([(
+            "state",
+            HostTestValue::String(name),
+        )]));
+        assert_eq!(
+            prop,
+            Prop::MacOsBackdrop(Some(MacOsBackdrop {
+                material: MacOsBackdropMaterial::default(),
+                blending: MacOsBackdropBlending::default(),
+                state,
+            })),
+            "{name}"
+        );
+    }
+    // The host prop's object names AppKit's roles, blending and state.
+    let prop = decode(HostTestValue::object([
+        ("material", HostTestValue::String("hudWindow")),
+        ("blending", HostTestValue::String("behindWindow")),
+        ("state", HostTestValue::String("followsWindowActiveState")),
+    ]));
+    let backdrop = MacOsBackdrop {
+        material: MacOsBackdropMaterial::HudWindow,
+        blending: MacOsBackdropBlending::BehindWindow,
+        state: MacOsBackdropState::FollowsWindowActiveState,
+    };
+    assert_eq!(prop, Prop::MacOsBackdrop(Some(backdrop)));
+    // Left out fields take their defaults.
+    assert_eq!(
+        decode(HostTestValue::Object(Vec::new())),
+        Prop::MacOsBackdrop(Some(MacOsBackdrop::default()))
+    );
+    // An unknown name, the kebab case the API no longer writes included,
+    // and a field of another type keep the default: a prop never fails.
+    for value in [
+        HostTestValue::String("unknown"),
+        HostTestValue::String("hud-window"),
+        HostTestValue::String("behind-window"),
+        HostTestValue::Number(1.0),
+    ] {
+        assert_eq!(
+            decode(HostTestValue::object([("material", value)])),
+            Prop::MacOsBackdrop(Some(MacOsBackdrop::default()))
+        );
+    }
+    // A value that is not an object clears the prop, as null does.
+    assert_eq!(
+        decode(HostTestValue::String("hudWindow")),
+        Prop::MacOsBackdrop(None)
+    );
+
+    let mut c = core();
+    apply(
+        &mut c,
+        vec![
+            Op::Create {
+                id: 2,
+                tag: Tag::View,
+            },
+            Op::SetProp {
+                id: 2,
+                prop: prop.clone(),
+            },
+            Op::Insert {
+                parent: ROOT_ID,
+                child: 2,
+                before: None,
+            },
+        ],
+    );
+    assert_eq!(
+        view_style_of(&c.commit().unwrap(), 2)
+            .unwrap()
+            .macos_backdrop,
+        Some(backdrop)
+    );
+    // Restyling preserves the platform prop, whether or not it has a blur.
+    c.apply(style_op(
+        2,
+        &[("backdropFilter", StyleValue::Str("blur(30px)"))],
+    ))
+    .unwrap();
+    assert_eq!(
+        view_style_of(&c.commit().unwrap(), 2)
+            .unwrap()
+            .macos_backdrop,
+        Some(backdrop)
+    );
+    // A cleared key resets the prop to none.
+    c.apply(Op::SetProp {
+        id: 2,
+        prop: <Prop as HostProps>::reset(&prop).unwrap(),
+    })
+    .unwrap();
+    assert_eq!(
+        view_style_of(&c.commit().unwrap(), 2)
+            .unwrap()
+            .macos_backdrop,
+        None
+    );
+    // The host decoder's null does the same.
+    assert_eq!(decode(HostTestValue::Null), Prop::MacOsBackdrop(None));
+}
+
+#[test]
+fn glass_tint_updates_and_removal_keeps_effects() {
+    let mut c = core();
+    apply(
+        &mut c,
+        vec![
+            Op::Create {
+                id: 2,
+                tag: Tag::View,
+            },
+            Op::Insert {
+                parent: ROOT_ID,
+                child: 2,
+                before: None,
+            },
+        ],
+    );
+    c.commit();
+    let style = |tint: Option<&str>| {
+        let mut props = vec![
+            ("backdropFilter", StyleValue::Str("blur(12px)")),
+            ("glassEffect", StyleValue::Str("regular")),
+        ];
+        if let Some(tint) = tint {
+            props.push(("glassTintColor", StyleValue::Str(tint)));
+        }
+        style_op(2, &props)
+    };
+    c.apply(style(Some("#ff0000"))).unwrap();
+    let mounted = view_style_of(&c.commit().unwrap(), 2).unwrap();
+    assert_eq!(mounted.glass_tint_color, Some(Color(0xff00_00ff)));
+    assert_eq!(mounted.glass_effect, crate::GlassEffect::Regular);
+    // A new color updates the native tint.
+    c.apply(style(Some("#00ff00"))).unwrap();
+    assert_eq!(
+        view_style_of(&c.commit().unwrap(), 2)
+            .unwrap()
+            .glass_tint_color,
+        Some(Color(0x00ff_00ff))
+    );
+    // The style without the key resets it; the glass and blur effects stay.
+    c.apply(style(None)).unwrap();
+    let mounted = view_style_of(&c.commit().unwrap(), 2).unwrap();
+    assert_eq!(mounted.glass_tint_color, None);
+    assert_eq!(mounted.glass_effect, crate::GlassEffect::Regular);
     assert!(!mounted.effects.unwrap().backdrop_filters.is_empty());
 }
 
@@ -5447,6 +5822,97 @@ fn pointer_events_classes_inherit_as_in_css() {
     .unwrap();
     let batch = c.commit().unwrap();
     assert_eq!(pointer(&batch, 2), Some(P::BoxOnly));
+}
+
+#[test]
+fn pointer_events_regions_are_worked_out_once_a_round_with_the_tree_it_left() {
+    use crate::props::PointerEvents as P;
+    let mut c = core();
+    // 2 none { 3, 4 auto }, 5 beside it.
+    view_with_classes(&mut c, 2, "pointer-events-none");
+    view_with_classes(&mut c, 5, "p-1");
+    for (id, classes) in [(3, "p-1"), (4, "pointer-events-auto")] {
+        apply(
+            &mut c,
+            vec![
+                Op::Create { id, tag: Tag::View },
+                class_op(id, classes),
+                Op::Insert {
+                    parent: 2,
+                    child: id,
+                    before: None,
+                },
+            ],
+        );
+    }
+    let batch = c.commit().unwrap();
+    let pointer = |batch: &MountBatch, id| {
+        batch.items.iter().rev().find_map(|i| match i {
+            MountItem::ViewProps { id: i, props } if *i == id => Some(props.pointer_events),
+            _ => None,
+        })
+    };
+    assert_eq!(pointer(&batch, 2), Some(P::BoxNone));
+    assert_eq!(pointer(&batch, 3), Some(P::None));
+    // In one round: 3 moves out of the region, its `auto` (4) is
+    // released, and many views come into the region (worked out with the
+    // region once).
+    let mut ops = vec![
+        Op::Remove {
+            parent: 2,
+            child: 3,
+        },
+        Op::Insert {
+            parent: 5,
+            child: 3,
+            before: None,
+        },
+        Op::Remove {
+            parent: 2,
+            child: 4,
+        },
+        Op::Release { id: 4 },
+    ];
+    for id in (100..400).step_by(2) {
+        ops.extend([
+            Op::Create { id, tag: Tag::View },
+            Op::Insert {
+                parent: 2,
+                child: id,
+                before: None,
+            },
+        ]);
+    }
+    apply(&mut c, ops);
+    let batch = c.commit().unwrap();
+    // Out of the region, 3 takes touches again; without its `auto` the
+    // region blocks them all.
+    assert_eq!(pointer(&batch, 3), Some(P::Auto));
+    assert_eq!(pointer(&batch, 2), Some(P::None));
+    // A view moved within the region (out and back in, as a caret moves)
+    // stays blocked by it: nothing to mount, never a `none` of its own.
+    apply(
+        &mut c,
+        vec![
+            Op::Remove {
+                parent: 2,
+                child: 100,
+            },
+            Op::Insert {
+                parent: 2,
+                child: 100,
+                before: None,
+            },
+        ],
+    );
+    if let Some(batch) = c.commit() {
+        assert_eq!(pointer(&batch, 100), None);
+        assert_eq!(pointer(&batch, 2), None);
+    }
+    // An `auto` in a newcomer lets touches through the region to it.
+    c.apply(class_op(398, "pointer-events-auto")).unwrap();
+    let batch = c.commit().unwrap();
+    assert_eq!(pointer(&batch, 2), Some(P::BoxNone));
 }
 
 #[test]
@@ -7426,6 +7892,33 @@ fn node_quota_and_dense_ids() {
 }
 
 #[test]
+fn the_id_table_follows_the_nodes_alive_not_every_id_made() {
+    let mut c = core();
+    // A stream of short-lived nodes with ever higher ids, as an app that
+    // re-renders for hours makes them.
+    let mut last = None;
+    for id in (2..2_000_000).step_by(2) {
+        c.apply(Op::Create { id, tag: Tag::View }).unwrap();
+        if let Some(old) = last.replace(id) {
+            c.apply(Op::Release { id: old }).unwrap();
+        }
+        if id % 20_000 == 0 {
+            c.commit();
+        }
+    }
+    c.commit();
+    assert!(
+        c.slots.pages() <= 2,
+        "{} pages for {} nodes",
+        c.slots.pages(),
+        c.slots.len()
+    );
+    // The newest node and the root are still known.
+    assert!(c.key(1_999_998).is_ok());
+    assert!(c.key(ROOT_ID).is_ok());
+}
+
+#[test]
 fn refused_urls_fail_and_send_nothing() {
     let mut c = core();
     c.set_access(Arc::new(crate::access::Access {
@@ -7507,6 +8000,21 @@ fn refused_urls_fail_and_send_nothing() {
     );
 }
 
+/// A refusal names the host to grant, or, for a URL no host grant can
+/// cover, how to write it: adding the URL itself would never grant it.
+#[test]
+fn refusals_name_the_host_to_grant_or_how_to_write_the_url() {
+    let refusal = |uri| super::not_granted("the web page", uri, "webview.hosts");
+    assert!(
+        refusal("https://docs.example.com/a").contains("add `docs.example.com` to capabilities")
+    );
+    for uri in ["https://bank.example\\@docs.example.com/", "not a url"] {
+        let message = refusal(uri);
+        assert!(!message.contains("add `"), "{message}");
+        assert!(message.contains("%5C"), "{message}");
+    }
+}
+
 #[test]
 fn refused_web_view_html_fails() {
     let mut c = core();
@@ -7546,6 +8054,141 @@ fn refused_web_view_html_fails() {
         fields.iter().any(
             |(k, v)| *k == "code" && *v == crate::PayloadValue::Str("ERR_ACCESS_DENIED".into())
         )
+    );
+}
+
+/// The source a web view's mount items last gave.
+fn web_source(batch: &MountBatch, view: NodeId) -> Option<crate::WebSource> {
+    batch.items.iter().rev().find_map(|i| match i {
+        MountItem::NativeProps {
+            id,
+            props: crate::NativeProps::WebView(p),
+        } if *id == view => Some(p.source.clone()),
+        _ => None,
+    })
+}
+
+/// Inline HTML loaded with a base URL runs at the base URL's origin
+/// (WebKit, Android, Windows), so the base URL takes the grant a page there
+/// would.
+#[test]
+fn web_view_base_urls_need_the_hosts_grant() {
+    let run_with = |capabilities: serde_json::Value, props: Vec<Prop>| {
+        let mut c = core();
+        c.set_access(Arc::new(crate::access::Access {
+            declared: crate::access::Capabilities::from_json(&capabilities).unwrap(),
+            granted: None,
+        }));
+        let mut ops = vec![
+            Op::Create {
+                id: 2,
+                tag: Tag::WebView,
+            },
+            Op::Listen {
+                id: 2,
+                event: EventKind::Error,
+                enabled: true,
+            },
+        ];
+        ops.extend(props.into_iter().map(|prop| Op::SetProp { id: 2, prop }));
+        ops.push(Op::Insert {
+            parent: ROOT_ID,
+            child: 2,
+            before: None,
+        });
+        apply(&mut c, ops);
+        let batch = c.commit().unwrap();
+        // The messages of the access errors reported.
+        let denied: Vec<String> = js_events(&mut c)
+            .into_iter()
+            .filter_map(|e| match e {
+                (2, EventKind::Error, EventPayload::Map(fields))
+                    if fields.iter().any(|(k, v)| {
+                        *k == "code" && *v == crate::PayloadValue::Str("ERR_ACCESS_DENIED".into())
+                    }) =>
+                {
+                    fields.into_iter().find_map(|(k, v)| match (k, v) {
+                        ("message", crate::PayloadValue::Str(m)) => Some(m.to_string()),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        (web_source(&batch, 2), denied)
+    };
+    let run = |props| {
+        run_with(
+            serde_json::json!({ "webview": { "hosts": ["docs.example.com"] } }),
+            props,
+        )
+    };
+    let html = |base: Option<&str>| crate::WebSource::Html {
+        html: "<b>hi</b>".into(),
+        base_url: base.map(Into::into),
+    };
+    let base_refused = |denied: &[String]| matches!(denied, [m] if m.contains("the base URL"));
+    for base in ["https://docs.example.com/a/", "about:blank", ""] {
+        // Granted: kept.
+        let (source, denied) = run(vec![
+            Prop::Native(NativeProp::BaseUrl(Some(base.into()))),
+            Prop::Native(NativeProp::Html(Some("<b>hi</b>".into()))),
+        ]);
+        assert_eq!(source, Some(html(Some(base))), "{base}");
+        assert!(denied.is_empty(), "{base}: {denied:?}");
+    }
+    for base in [
+        "https://bank.example/",
+        "file:///etc/",
+        "not a url",
+        // WHATWG reads bank.example: the backslash ends the host.
+        "https://bank.example\\@docs.example.com/",
+    ] {
+        // `html` with `baseUrl`, either order, and Rust's
+        // `.html(html, Some(base))`: the page loads without the base URL.
+        for props in [
+            vec![
+                Prop::Native(NativeProp::BaseUrl(Some(base.into()))),
+                Prop::Native(NativeProp::Html(Some("<b>hi</b>".into()))),
+            ],
+            vec![
+                Prop::Native(NativeProp::Html(Some("<b>hi</b>".into()))),
+                Prop::Native(NativeProp::BaseUrl(Some(base.into()))),
+            ],
+            vec![Prop::Native(NativeProp::Source(html(Some(base))))],
+        ] {
+            let (source, denied) = run(props);
+            assert_eq!(source, Some(html(None)), "{base}");
+            assert!(base_refused(&denied), "{base}: {denied:?}");
+        }
+    }
+    // A subdomain grant: WHATWG reads bank.example here too.
+    let (source, denied) = run_with(
+        serde_json::json!({ "webview": { "hosts": ["*.docs.example.com"] } }),
+        vec![
+            Prop::Native(NativeProp::BaseUrl(Some(
+                "https://bank.example\\.docs.example.com/".into(),
+            ))),
+            Prop::Native(NativeProp::Html(Some("<b>hi</b>".into()))),
+        ],
+    );
+    assert_eq!(source, Some(html(None)));
+    assert!(base_refused(&denied), "{denied:?}");
+    // Without web views at all, the HTML itself is refused, once.
+    let (source, denied) = run_with(
+        serde_json::json!({}),
+        vec![
+            Prop::Native(NativeProp::BaseUrl(Some("https://bank.example/".into()))),
+            Prop::Native(NativeProp::Html(Some("<b>hi</b>".into()))),
+        ],
+    );
+    assert!(
+        !matches!(source, Some(crate::WebSource::Html { .. })),
+        "{source:?}"
+    );
+    assert!(
+        matches!(&denied[..], [m] if m.contains("web views are not granted")),
+        "{denied:?}"
     );
 }
 
@@ -7603,6 +8246,52 @@ fn web_view_incognito_is_read_when_it_is_made() {
         }],
     );
     assert_eq!(web(&c.commit().unwrap()), Some(true));
+}
+
+#[test]
+fn web_view_url_schemes_are_read_when_it_is_made() {
+    use crate::web_resource::WebUrlScheme;
+    let scheme = WebUrlScheme::new("app-image", |request| request.fail()).unwrap();
+    let mut c = core();
+    apply(
+        &mut c,
+        vec![
+            Op::Create {
+                id: 2,
+                tag: Tag::WebView,
+            },
+            Op::SetProp {
+                id: 2,
+                prop: Prop::Native(NativeProp::UrlSchemes(vec![scheme.clone()])),
+            },
+            Op::Insert {
+                parent: ROOT_ID,
+                child: 2,
+                before: None,
+            },
+        ],
+    );
+    let schemes = |batch: &MountBatch| {
+        batch.items.iter().rev().find_map(|item| match item {
+            MountItem::NativeProps {
+                id: 2,
+                props: crate::NativeProps::WebView(p),
+            } => Some(p.url_schemes.clone()),
+            _ => None,
+        })
+    };
+    // The platform makes the web view with its first props.
+    assert_eq!(schemes(&c.commit().unwrap()), Some(vec![scheme.clone()]));
+    // Made: another handler is ignored, and nothing is sent for it.
+    let other = WebUrlScheme::new("app-image", |request| request.fail()).unwrap();
+    apply(
+        &mut c,
+        vec![Op::SetProp {
+            id: 2,
+            prop: Prop::Native(NativeProp::UrlSchemes(vec![other])),
+        }],
+    );
+    assert_eq!(c.commit().as_ref().and_then(schemes), None);
 }
 
 mod components {
@@ -9643,7 +10332,7 @@ mod components {
             })
         };
         let themed = |hex: u32| {
-            tokens_with(&[("primary", rgb(hex).into())]).over(&test_tokens(None).unwrap())
+            tokens_with(&[("primary", rgb(hex).into())]).over(&test_tokens(None).unwrap().0)
         };
         c.commit().unwrap();
         c.set_host_tokens(Some(themed(0x00ff00)));
@@ -14336,6 +15025,98 @@ mod views {
         assert_eq!(texts(&c.commit().unwrap()), ["log 3"]);
     }
 
+    /// Rebuilds a text with fresh bindings, then with static values, then
+    /// without its optional style and label.
+    #[component]
+    fn ReboundText() -> impl IntoElement {
+        let run = signal(0_u8);
+        let current = signal(None::<Signal<bool>>);
+        view()
+            .child(text("break").on_press(move || {
+                current.get_untracked().unwrap().set(true);
+            }))
+            .child(text("switch").on_press(move || run.update(|n| *n += 1)))
+            .child(dynamic(move || {
+                let at = run.get();
+                if at >= 4 {
+                    return text("fine").into_element();
+                }
+                if at == 3 {
+                    return text("fine")
+                        .text_color(rgb(0x808080))
+                        .label("fine")
+                        .into_element();
+                }
+                let bad = signal(false);
+                current.set(Some(bad));
+                text(move || if bad.get() { "bad" } else { "fine" })
+                    .text_color(move || {
+                        if bad.get() {
+                            rgb(0xff0000)
+                        } else {
+                            rgb(0x808080)
+                        }
+                    })
+                    .style_when(bad, |s| s.opacity(0.5))
+                    .label(move || if bad.get() { "bad" } else { "fine" })
+                    .into_element()
+            }))
+    }
+
+    #[test]
+    fn reused_nodes_diff_against_their_latest_bound_values() {
+        let mut c = core();
+        c.mount_root(&Root::of::<ReboundText>());
+        let batch = c.commit().unwrap();
+        let (break_it, switch, line) = (
+            text_node(&batch, "break"),
+            text_node(&batch, "switch"),
+            text_node(&batch, "fine"),
+        );
+        assert!(c.component_event(switch, EventKind::Press, &EventPayload::None));
+        assert!(
+            c.commit().is_none(),
+            "unchanged bindings send no mount items"
+        );
+        for _ in 0..2 {
+            assert!(c.component_event(break_it, EventKind::Press, &EventPayload::None));
+            let batch = c.commit().unwrap();
+            assert!(batch.items.iter().any(|i| matches!(i,
+                MountItem::Text { id, text, .. }
+                    if *id == line && text.text == "bad" && text.spans[0].style.color == crate::Color(0xff0000ff)
+            )));
+            assert!(batch.items.iter().any(|i| matches!(i,
+                MountItem::AccessibilityLabel { id, label } if *id == line && label.as_deref() == Some("bad")
+            )));
+
+            assert!(c.component_event(switch, EventKind::Press, &EventPayload::None));
+            let batch = c.commit().expect("the new run resets the bound values");
+            assert!(batch.items.iter().any(|i| matches!(i,
+                MountItem::Text { id, text, .. }
+                    if *id == line && text.text == "fine" && text.spans[0].style.color == crate::Color(0x808080ff)
+            )), "the reused text resets its content and color: {:?}", batch.items);
+            assert!(batch.items.iter().any(|i| matches!(i,
+                MountItem::AccessibilityLabel { id, label } if *id == line && label.as_deref() == Some("fine")
+            )));
+            assert_eq!(view_style_of(&batch, line).unwrap().opacity, 1.0);
+            assert!(
+                !batch
+                    .items
+                    .iter()
+                    .any(|i| matches!(i, MountItem::Create { .. } | MountItem::Delete { .. })),
+                "the node is reused"
+            );
+        }
+        // Static values remain cheap, including after the binding was removed.
+        assert!(c.component_event(switch, EventKind::Press, &EventPayload::None));
+        let batch = c.commit().unwrap();
+        assert!(batch.items.iter().any(|i| matches!(i,
+            MountItem::AccessibilityLabel { id, label } if *id == line && label.is_none()
+        )));
+        assert!(c.component_event(switch, EventKind::Press, &EventPayload::None));
+        assert!(c.commit().is_none(), "unchanged values send no mount items");
+    }
+
     #[test]
     fn a_prop_from_js_reaches_only_what_reads_it() {
         let mut c = core();
@@ -14919,6 +15700,67 @@ mod views {
             _ => None,
         });
         assert!(style.is_some(), "{:#?}", batch.items);
+    }
+
+    #[component]
+    fn OptionalGlassTint() -> impl IntoElement {
+        let step = stored(0_u8);
+        let tint = signal(Some(AdaptiveColor::rgb(0xff0000, 0x00ff00)));
+        view()
+            .size_10()
+            .glass_effect(crate::GlassEffect::Regular)
+            .backdrop_blur(px(12.0))
+            .glass_tint_color(rgb(0xaabbcc))
+            .glass_tint_color(tint)
+            .on_press(move |_: &()| {
+                step.with(|value| *value += 1);
+                tint.set(match step.get() {
+                    1 => None,
+                    2 => Some(AdaptiveColor::TRANSPARENT),
+                    _ => Some(AdaptiveColor::rgb(0x0000ff, 0xffff00)),
+                });
+            })
+    }
+
+    #[test]
+    fn an_optional_tint_restores_native_default_without_losing_glass() {
+        for dark in [false, true] {
+            let mut c = core();
+            c.set_class_environment(crate::tailwind::ClassEnvironment {
+                dark,
+                ..Default::default()
+            });
+            c.mount_root(&Root::new::<OptionalGlassTint>(|| ()));
+            let mut batch = c.commit().unwrap();
+            let host = root_host(&batch);
+            let expected = [
+                Some(if dark {
+                    Color(0x00ff00ff)
+                } else {
+                    Color(0xff0000ff)
+                }),
+                None,
+                Some(Color::TRANSPARENT),
+                Some(if dark {
+                    Color(0xffff00ff)
+                } else {
+                    Color(0x0000ffff)
+                }),
+            ];
+            for (step, tint) in expected.into_iter().enumerate() {
+                if step != 0 {
+                    assert!(c.component_event(host, EventKind::Press, &EventPayload::None));
+                    batch = c.commit().unwrap();
+                }
+                let style = view_style_of(&batch, host).unwrap();
+                assert_eq!(style.glass_tint_color, tint, "dark={dark}, step={step}");
+                assert_eq!(style.glass_effect, crate::GlassEffect::Regular);
+                assert_eq!(
+                    style.effects.as_ref().unwrap().backdrop_filters,
+                    [crate::Filter::Blur(px(12.0))]
+                );
+            }
+        }
     }
 
     /// A track whose color moves between two theme colors natively.
@@ -18366,6 +19208,149 @@ mod rust_windows {
         );
     }
 
+    #[component]
+    fn Empty() -> impl IntoElement {
+        view()
+    }
+
+    #[test]
+    fn rust_open_window_opens_one_window_per_id_until_it_closes() {
+        use crate::element::desktop::open_window;
+        let mut c = core();
+        c.set_environment(crate::element::Environment {
+            os: crate::platform::Os::MacOs,
+            ..Default::default()
+        });
+        c.mount_root(&Root::of::<Empty>());
+        let _ = c.commit().unwrap();
+        let closed = Rc::new(RefCell::new(Vec::new()));
+        let doc = {
+            let _entered = c.components.runtime.enter();
+            let closed = closed.clone();
+            open_window(
+                window()
+                    .id("doc:1")
+                    .title("Doc 1")
+                    .on_open_change(move |e| closed.borrow_mut().push(e.reason))
+                    .content(|| {
+                        INSIDE.with(|i| *i.borrow_mut() = Some(current_window().id().to_owned()));
+                        text("Doc 1")
+                    }),
+            )
+            .expect("opens on a desktop")
+        };
+        assert_eq!(doc.id(), "doc:1");
+        let batch = c.commit().unwrap();
+        let commands = desktop_commands(&batch);
+        let [(id, DesktopCommand::OpenWindow(open))] = &commands[..] else {
+            panic!("one window opens: {commands:?}");
+        };
+        assert_eq!(open.options.id, "doc:1");
+        assert_eq!(
+            INSIDE.with(|i| i.borrow().clone()).as_deref(),
+            Some("doc:1")
+        );
+        // The same id again: the open window, focused, not a second one.
+        let again = {
+            let _entered = c.components.runtime.enter();
+            open_window(window().id("doc:1").content(|| text("Other")))
+        };
+        assert!(again.as_ref() == Some(&doc));
+        let batch = c.commit().unwrap();
+        assert_eq!(
+            desktop_commands(&batch),
+            [(*id, DesktopCommand::Request(WindowRequest::Focus))]
+        );
+        // Its ref closes it: the app hears it and the window's root goes.
+        {
+            let _entered = c.components.runtime.enter();
+            doc.close();
+        }
+        let batch = c.commit().unwrap();
+        assert_eq!(*closed.borrow(), [WindowCloseCause::Close]);
+        assert!(
+            batch
+                .items
+                .iter()
+                .any(|item| matches!(item, MountItem::Remove { id: removed } | MountItem::Delete { id: removed } if removed == id)),
+            "{:?}",
+            batch.items
+        );
+        // A closed ref's signals are gone; reading it is safe.
+        {
+            let _entered = c.components.runtime.enter();
+            assert_eq!(doc.state(), None);
+            assert_eq!(doc.title_bar(), Edges::default());
+        }
+        // Closed, the id opens a new window.
+        {
+            let _entered = c.components.runtime.enter();
+            assert!(open_window(window().id("doc:1").content(|| text("Doc 1"))).is_some());
+        }
+        let batch = c.commit().unwrap();
+        assert!(matches!(
+            &desktop_commands(&batch)[..],
+            [(_, DesktopCommand::OpenWindow(_))]
+        ));
+    }
+
+    #[component]
+    fn WithNotes() -> impl IntoElement {
+        view().child(window().id("notes").content(|| text("Notes")))
+    }
+
+    #[test]
+    fn rust_open_window_finds_declared_windows_and_follows_capabilities() {
+        use crate::element::desktop::open_window;
+        // Off the desktops: nothing opens.
+        let mut c = core();
+        c.mount_root(&Root::of::<Empty>());
+        let _ = c.commit().unwrap();
+        {
+            let _entered = c.components.runtime.enter();
+            assert!(open_window(window().id("doc")).is_none());
+        }
+        // A `window()` in the tree with the id: focused, not a second one.
+        let mut c = core();
+        c.set_environment(crate::element::Environment {
+            os: crate::platform::Os::MacOs,
+            ..Default::default()
+        });
+        c.mount_root(&Root::of::<WithNotes>());
+        let batch = c.commit().unwrap();
+        let [(notes, DesktopCommand::OpenWindow(_))] = &desktop_commands(&batch)[..] else {
+            panic!("the declared window opens");
+        };
+        let notes = *notes;
+        {
+            let _entered = c.components.runtime.enter();
+            let found = open_window(window().id("notes").content(|| text("Other")));
+            assert_eq!(found.as_ref().map(|w| w.id()), Some("notes"));
+        }
+        let batch = c.commit().unwrap();
+        assert_eq!(
+            desktop_commands(&batch),
+            [(notes, DesktopCommand::Request(WindowRequest::Focus))]
+        );
+        // Not granted by the capabilities: nothing opens, as `Window.open`
+        // throws.
+        let mut c = core();
+        c.set_environment(crate::element::Environment {
+            os: crate::platform::Os::MacOs,
+            ..Default::default()
+        });
+        let mut access = crate::access::Access::all();
+        access.declared.windows = None;
+        c.set_access(std::sync::Arc::new(access));
+        c.mount_root(&Root::of::<Empty>());
+        let _ = c.commit().unwrap();
+        {
+            let _entered = c.components.runtime.enter();
+            assert!(open_window(window().id("doc")).is_none());
+        }
+        assert!(c.commit().is_none_or(|b| desktop_commands(&b).is_empty()));
+    }
+
     thread_local! {
         static PRESSES: RefCell<Vec<(String, crate::desktop::CloseReason)>> =
             const { RefCell::new(Vec::new()) };
@@ -18423,7 +19408,7 @@ mod rust_windows {
     }
 
     thread_local! {
-        static FITTED: RefCell<Option<crate::element::desktop::WindowHandle>> =
+        static FITTED: RefCell<Option<crate::element::desktop::WindowRef>> =
             const { RefCell::new(None) };
     }
 
@@ -31397,4 +32382,67 @@ fn only_greedy_lines_without_a_limit_share_measurements() {
     measure_text(&greedy, &mut cache, &mut cx, Some(100.0));
     measure_text(&greedy, &mut cache, &mut cx, Some(90.0));
     assert_eq!(greedy.measures.get(), 2);
+}
+
+#[test]
+fn overlays_with_a_cover_follow_its_size_changing() {
+    use StyleValue::Number;
+    let mut c = Core::new(FakeEngine::default(), size_pt(1920.0, 1080.0));
+    c.set_tokens(crate::element::tokens::sample());
+    // A slot 1904 × 464 at (8, 608), under a pane 600 tall.
+    add(&mut c, 2, Tag::View, ROOT_ID, &[("height", Number(600.0))]);
+    add(
+        &mut c,
+        4,
+        Tag::View,
+        ROOT_ID,
+        &[("flexGrow", Number(1.0)), ("padding", Number(8.0))],
+    );
+    add(&mut c, 6, Tag::View, 4, &[("flexGrow", Number(1.0))]);
+    // A view over it whose size the app sets once the slot's is known.
+    add(&mut c, 8, Tag::Overlay, ROOT_ID, &[]);
+    add(
+        &mut c,
+        10,
+        Tag::View,
+        8,
+        &[("width", Number(0.0)), ("height", Number(0.0))],
+    );
+    apply(
+        &mut c,
+        vec![
+            overlay_prop(
+                8,
+                crate::OverlayProp::Anchor(crate::overlay::OverlayAnchor::Node(6)),
+            ),
+            overlay_prop(8, crate::OverlayProp::Cover(Some(10))),
+        ],
+    );
+    c.commit();
+    let resize = |c: &mut Core<FakeEngine>, w: f32, h: f32| {
+        apply(
+            c,
+            vec![style_op(10, &[("width", Number(w)), ("height", Number(h))])],
+        );
+        c.commit();
+        c.measure(10).map(|m| Bounds {
+            origin: m.page,
+            size: m.frame.size,
+        })
+    };
+    // As large as the slot: on it, not where its former 0 × 0 frame put it.
+    assert_eq!(
+        resize(&mut c, 1904.0, 464.0),
+        Some(rect(8.0, 608.0, 1904.0, 464.0))
+    );
+    // Taller: its middle on the slot's, kept inside the window.
+    assert_eq!(
+        resize(&mut c, 1888.0, 720.0),
+        Some(rect(8.0, 360.0, 1888.0, 720.0))
+    );
+    // Back: on the slot again, not where its former height put it.
+    assert_eq!(
+        resize(&mut c, 1904.0, 464.0),
+        Some(rect(8.0, 608.0, 1904.0, 464.0))
+    );
 }

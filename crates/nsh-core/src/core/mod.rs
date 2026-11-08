@@ -653,6 +653,8 @@ struct Node {
     elevation: Points,
     /// `ios={{ backdropMaterial }}`.
     backdrop_material: crate::BackdropMaterial,
+    /// `macos={{ backdrop }}`.
+    macos_backdrop: Option<crate::MacOsBackdrop>,
     /// A text block: its attachments (inline views and images, in text
     /// order) whose native views are inside its own.
     attached: Vec<NodeId>,
@@ -740,6 +742,7 @@ impl Node {
         let mut style = Box::new(self.view_style.clone());
         style.elevation = self.elevation;
         style.backdrop_material = self.backdrop_material;
+        style.macos_backdrop = self.macos_backdrop;
         // A list in its parent's viewport is a plain view clipping its
         // cells (a scroll view clips its content).
         if self.list.as_ref().is_some_and(|l| l.parent) {
@@ -888,6 +891,7 @@ impl Node {
             overlay_watched: 0,
             elevation: Points::ZERO,
             backdrop_material: crate::BackdropMaterial::default(),
+            macos_backdrop: None,
             dirty: 0,
             queued: false,
             text_queued: false,
@@ -1055,7 +1059,7 @@ impl ApplyError {
 pub struct Core<M: TextEngine> {
     nodes: Slab<Node>,
     /// Node id -> key + 1 (0 = none). Ids are dense, so this is a flat vec.
-    slots: Vec<u32>,
+    slots: crate::id_table::IdTable<Key>,
     layout: LayoutTree<LeafContext<M::Prepared>>,
     text_engine: Rc<M>,
     measure_cache: MeasureCache,
@@ -1191,6 +1195,13 @@ pub struct Core<M: TextEngine> {
     /// Nodes whose classes say `pointer-events-none`: without any, moving
     /// nodes skips what CSS's inherited `pointer-events` needs.
     pointer_none_classes: u32,
+    /// The tops of the `pointer-events-*` regions that views joined or
+    /// left, or whose classes changed, since the last round: worked out
+    /// once each, before the round's mount items
+    /// ([`Self::flush_pointer_events`]). Worked out on every move, a
+    /// region's whole subtree was walked for each view inserted in it (an
+    /// editor's highlighted rows: 1600 spans, 2500 views, 10 ms a commit).
+    pointer_pending: Vec<Key>,
     /// The view with the keyboard focus, by key and id (keys are reused),
     /// as the platform reports it (`classes::focus_reported`).
     focus: Option<(Key, NodeId)>,
@@ -1310,8 +1321,8 @@ impl<M: TextEngine> Core<M> {
                 ..terminal_layout::Role::default()
             },
         );
-        let mut slots = vec![0; 256];
-        slots[ROOT_ID as usize] = root + 1;
+        let mut slots = crate::id_table::IdTable::new();
+        slots.insert(ROOT_ID as usize, root);
         Self {
             nodes,
             slots,
@@ -1385,6 +1396,7 @@ impl<M: TextEngine> Core<M> {
             status_bar_nodes: Vec::new(),
             status_bars_moved: false,
             pointer_none_classes: 0,
+            pointer_pending: Vec::new(),
             focus: None,
             focus_chain: Vec::new(),
             focus_scratch: Vec::new(),
@@ -1525,9 +1537,22 @@ impl<M: TextEngine> Core<M> {
         self.nodes.len()
     }
 
+    /// How many node ids the core's id table has room for: far above
+    /// [`Self::node_count`] when the ids of nodes that are gone still take
+    /// room (diagnostics).
+    pub fn node_id_room(&self) -> usize {
+        self.slots.len()
+    }
+
     /// Sets what the app may reach: remote images, canvas images, video
     /// sources, web views and the status bar are checked against it.
     pub fn set_access(&mut self, access: Arc<crate::access::Access>) {
+        // `open_window` checks windows as `Window.open` does.
+        {
+            let _entered = self.components.runtime.enter();
+            crate::element::global::<crate::element::desktop::WindowAccess>()
+                .set(crate::element::desktop::WindowAccess(Some(access.clone())));
+        }
         self.access = access;
     }
 
@@ -2689,6 +2714,7 @@ impl<M: TextEngine> Core<M> {
         if let Some(animation) = self.layout_animation.take() {
             self.mount.insert(0, MountItem::LayoutAnimation(animation));
         }
+        self.flush_pointer_events();
         self.flush_dirty();
         let relayout = self.needs_layout;
         if relayout {
@@ -2923,8 +2949,8 @@ impl<M: TextEngine> Core<M> {
     #[inline]
     fn key(&self, id: NodeId) -> Result<Key, ApplyError> {
         match self.slots.get(id as usize) {
-            Some(&k) if k != 0 => Ok(k - 1),
-            _ => Err(ApplyError::UnknownNode(id)),
+            Some(&k) => Ok(k),
+            None => Err(ApplyError::UnknownNode(id)),
         }
     }
 
@@ -2933,16 +2959,14 @@ impl<M: TextEngine> Core<M> {
         if self.nodes.len() >= self.max_nodes {
             return Err(ApplyError::TooManyNodes(self.max_nodes));
         }
-        if idx > self.slots.len().saturating_add(self.max_nodes) {
+        if idx > self.slots.extent().saturating_add(self.max_nodes) {
             return Err(ApplyError::IdOutOfRange(id));
         }
-        if idx >= self.slots.len() {
-            self.slots.resize((idx + 1).next_power_of_two(), 0);
-        } else if self.slots[idx] != 0 {
+        if self.slots.contains(idx) {
             return Err(ApplyError::DuplicateNode(id));
         }
         let key = self.nodes.insert(Node::new(id, kind)) as Key;
-        self.slots[idx] = key + 1;
+        self.slots.insert(idx, key);
         Ok(key)
     }
 
@@ -2953,15 +2977,13 @@ impl<M: TextEngine> Core<M> {
     pub(super) fn alias(&mut self, alias: NodeId, id: NodeId) -> Result<(), ApplyError> {
         let key = self.key(id)?;
         let idx = alias as usize;
-        if idx > self.slots.len().saturating_add(self.max_nodes) {
+        if idx > self.slots.extent().saturating_add(self.max_nodes) {
             return Err(ApplyError::IdOutOfRange(alias));
         }
-        if idx >= self.slots.len() {
-            self.slots.resize((idx + 1).next_power_of_two(), 0);
-        } else if self.slots[idx] != 0 {
+        if self.slots.contains(idx) {
             return Err(ApplyError::DuplicateNode(alias));
         }
-        self.slots[idx] = key + 1;
+        self.slots.insert(idx, key);
         Ok(())
     }
 
@@ -2973,7 +2995,7 @@ impl<M: TextEngine> Core<M> {
     /// Forgets alias `id` (its node stays).
     pub(super) fn unalias(&mut self, id: NodeId) {
         if self.is_alias(id) {
-            self.slots[id as usize] = 0;
+            self.slots.remove(id as usize);
         }
     }
 
@@ -4003,6 +4025,34 @@ impl<M: TextEngine> Core<M> {
                 no_webviews(self);
                 Prop::Native(NativeProp::Source(crate::WebSource::None))
             }
+            // Inline HTML with a base URL runs at that URL's origin (WebKit's
+            // `loadHTMLString:baseURL:`, Android's `loadDataWithBaseURL`,
+            // Windows answering the base URL's request with it): the base
+            // URL takes the grant a page there would, and without it the
+            // HTML loads with no base. Without web views at all, the arms
+            // above refuse the HTML itself, and that is the one error.
+            Prop::Native(NativeProp::BaseUrl(Some(url)))
+                if kind == Kind::WebView
+                    && !url.is_empty()
+                    && self.access.allows_webviews()
+                    && !self.access.allows_webview(&url) =>
+            {
+                refuse(self, "the base URL", &url, "webview.hosts");
+                Prop::Native(NativeProp::BaseUrl(None))
+            }
+            Prop::Native(NativeProp::Source(crate::WebSource::Html {
+                html,
+                base_url: Some(url),
+            })) if kind == Kind::WebView
+                && !url.is_empty()
+                && !self.access.allows_webview(&url) =>
+            {
+                refuse(self, "the base URL", &url, "webview.hosts");
+                Prop::Native(NativeProp::Source(crate::WebSource::Html {
+                    html,
+                    base_url: None,
+                }))
+            }
             prop => prop,
         }
     }
@@ -4755,6 +4805,12 @@ impl<M: TextEngine> Core<M> {
                     flags |= dirty::VIEW;
                 }
             }
+            Prop::MacOsBackdrop(value) => {
+                if node.macos_backdrop != value {
+                    node.macos_backdrop = value;
+                    flags |= dirty::VIEW;
+                }
+            }
             Prop::ActiveStyle(patch) => {
                 self.set_part_style(key, classes::Part::Active, patch);
                 return Ok(());
@@ -5106,19 +5162,33 @@ impl<M: TextEngine> Core<M> {
                     self.set_disabled(key, d);
                 }
                 let node = &mut self.nodes[key as usize];
-                // The platforms make a web view's website data store with
-                // the web view, from its first props.
-                if let (NativeProp::Incognito(on), Some(NativeProps::WebView(p))) =
-                    (&prop, node.control.as_deref())
-                    && node.created
+                // The platforms make a web view with its website data store
+                // and the URL schemes it serves, from its first props.
+                if node.created
+                    && let Some(NativeProps::WebView(p)) = node.control.as_deref()
                 {
-                    if *on != p.incognito {
-                        log::warn!(
-                            target: "js",
-                            "a web view's `incognito` is read when it is made; render a new element to change it"
-                        );
+                    let changed = match &prop {
+                        NativeProp::Incognito(on) => Some(("`incognito` is", *on != p.incognito)),
+                        // A re-render builds new handlers: only a change
+                        // of the schemes served is worth a warning.
+                        NativeProp::UrlSchemes(schemes) => Some((
+                            "URL schemes are",
+                            !schemes
+                                .iter()
+                                .map(|s| s.scheme())
+                                .eq(p.url_schemes.iter().map(|s| s.scheme())),
+                        )),
+                        _ => None,
+                    };
+                    if let Some((what, changed)) = changed {
+                        if changed {
+                            log::warn!(
+                                target: "js",
+                                "a web view's {what} read when it is made; render a new element to change it"
+                            );
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
                 }
                 if let Some(control) = node.control.as_mut() {
                     apply_native(control, prop);
@@ -5466,7 +5536,7 @@ impl<M: TextEngine> Core<M> {
         self.spacing_changed(parent, NO_KEY);
         if self.pointer_none_classes > 0 && self.pointer_region(parent).is_some() {
             // It no longer inherits the region's `none`.
-            self.update_pointer_events(key);
+            self.pointer_pending.push(key);
             self.pointer_events_moved(parent);
         }
         self.groups_changed(key, parent);
@@ -5593,7 +5663,7 @@ impl<M: TextEngine> Core<M> {
         }
         let node = self.nodes.remove(key as usize);
         self.ch_readers -= usize::from(node.reads_ch);
-        self.slots[id as usize] = 0;
+        self.slots.remove(id as usize);
         if node.class_props.as_ref().and_then(|c| c.pointer_events)
             == Some(crate::props::PointerEvents::None)
         {
@@ -5876,6 +5946,7 @@ impl<M: TextEngine> Core<M> {
         if node.view_style != ViewStyle::default()
             || node.elevation != Points::ZERO
             || node.backdrop_material != crate::BackdropMaterial::default()
+            || node.macos_backdrop.is_some()
             || parent_list
             || node.spare
         {
@@ -6224,7 +6295,19 @@ impl<M: TextEngine> Core<M> {
             {
                 let mut config = root.modal;
                 config.window = self.window_of(key);
-                self.mount.push(MountItem::ModalConfig { id, config });
+                // A platform presents a dialog when it is inserted, over the
+                // window its config names: a dialog inserted in this batch
+                // (one that mounts in a window of the app's own already
+                // open) gets its config ahead of its insertion.
+                let item = MountItem::ModalConfig { id, config };
+                match self
+                    .mount
+                    .iter()
+                    .position(|m| matches!(m, MountItem::Insert { child, .. } if *child == id))
+                {
+                    Some(at) => self.mount.insert(at, item),
+                    None => self.mount.push(item),
+                }
             }
             if flags & dirty::NAV_SHADER != 0
                 && let Some(root) = &node.root
@@ -8956,8 +9039,8 @@ fn definite(size: Size<Points>) -> taffy::Size<AvailableSpace> {
 
 /// The message for a refused URL.
 fn not_granted(what: &str, uri: &str, capability: &str) -> String {
-    let host = crate::access::parse_url(uri).map_or_else(|| uri.to_owned(), |u| u.host);
-    format!("{what} {uri} is not granted: add `{host}` to capabilities.{capability} in nsh.json")
+    let advice = crate::access::grant_advice(uri, capability);
+    format!("{what} {uri} is not granted: {advice}")
 }
 
 /// Applies one property to a control.
@@ -9006,6 +9089,7 @@ fn apply_native(control: &mut NativeProps, prop: NativeProp) {
         (NativeProps::WebView(p), P::JavaScriptEnabled(v)) => p.javascript_enabled = v,
         (NativeProps::WebView(p), P::BackForwardGestures(v)) => p.back_forward_gestures = v,
         (NativeProps::WebView(p), P::Incognito(v)) => p.incognito = v,
+        (NativeProps::WebView(p), P::UrlSchemes(v)) => p.url_schemes = v,
         (NativeProps::Video(p), P::Source(v)) => {
             p.source = match v {
                 crate::WebSource::Uri(uri) => Some(uri),

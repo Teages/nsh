@@ -170,7 +170,8 @@ Type checks the app. An app with Rust crates of its own (`nsh.json` `"rust"`) ha
 
 NSH-generated files stay under `.nsh/`: declarations, runner sources, and default build/package outputs in
 `.nsh/out/`. Cargo keeps its normal `target/` cache and existing `CARGO_TARGET_DIR` behavior; NSH does not
-add Cargo configuration to relocate it. `--out` still overrides the output location.
+add Cargo configuration to relocate it. `--out` still overrides the output location. With [huacnlee/cargo](https://github.com/huacnlee/cargo), which we
+recommend, the builds live under `~/.cargo/targets/` and the binaries still land in `target/`.
 
 ## nsh build
 
@@ -235,6 +236,25 @@ nsh package my-app --target web
 ```
 
 See [Packaging](./packaging.md).
+
+## nsh update
+
+Updates an installed `nsh` to the latest build of its channel; naming one, as `rustup update nightly`
+does, switches channels ([Installation](./installation.md#updating)).
+
+```sh
+nsh update [stable|nightly]
+```
+
+## nsh component
+
+Adds, removes or lists the runtimes installed next to an installed `nsh`: those of the platforms other than the one it runs on (`android`, `android-symbols`, `ios`, `web`, `gpui`, `tui`). A command that needs one adds it itself the first time ([Installation](./installation.md#components)).
+
+```sh
+nsh component list
+nsh component add <NAME>...
+nsh component remove <NAME>...
+```
 
 ## Signing commands
 
